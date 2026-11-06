@@ -1,0 +1,97 @@
+name: seal-build
+
+# Upstream builds and tests on CircleCI only (.circleci/config.yml: cimg/openjdk:15.0,
+# `./gradlew check test` plus `./gradlew dockerTest` on a machine executor). This
+# workflow mirrors those two jobs for micrometer-core and packs its jar.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test selector (e.g. ":micrometer-core:test --tests FooTest"); empty runs the full suite'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"'
+      GRADLE_FLAGS: >-
+        --no-daemon --console=plain --stacktrace
+        -I ${{ github.workspace }}/../test-logging.gradle
+        -Prelease.version=1.5.7 -Prelease.stage=final -Prelease.disableGitChecks=true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '15.0.1'
+
+      - name: Allow the legacy Docker API used by testcontainers 1.14.1
+        run: |
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/min-api.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker || { sudo journalctl -xeu docker.service --no-pager | tail -50; exit 1; }
+          docker version
+          # testcontainers 1.14.1 defaults to quay.io/testcontainers/ryuk:0.2.3, which
+          # quay.io no longer serves; use the Docker Hub image instead.
+          echo 'ryuk.container.image=testcontainers/ryuk:0.3.0' > ~/.testcontainers.properties
+          docker pull testcontainers/ryuk:0.3.0
+
+      - name: Write Gradle test-logging init script
+        run: |
+          cat > "${{ github.workspace }}/../test-logging.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  testLogging {
+                      events 'passed', 'skipped', 'failed'
+                      exceptionFormat 'full'
+                  }
+                  afterSuite { desc, result ->
+                      if (!desc.parent) {
+                          println "TEST SUMMARY ${t.path}: ${result.resultType} - ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Test and build micrometer-core
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_FLAGS ${{ inputs.test-filter }} :micrometer-core:jar
+          else
+            ./gradlew $GRADLE_FLAGS :micrometer-core:test :micrometer-core:dockerTest :micrometer-core:jar
+          fi
+
+      - name: Report skipped tests with their reasons
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          src_root = 'micrometer-core/src/test/java'
+          for f in sorted(glob.glob('micrometer-core/build/test-results/*/*.xml')):
+              for tc in ET.parse(f).getroot().iter('testcase'):
+                  sk = tc.find('skipped')
+                  if sk is None:
+                      continue
+                  cls, name = tc.get('classname'), tc.get('name')
+                  reason = sk.get('message') or ''
+                  path = os.path.join(src_root, cls.split('$')[0].replace('.', '/') + '.java')
+                  if not reason and os.path.exists(path):
+                      lines = open(path, encoding='utf-8').read().splitlines()
+                      hits = [l.strip() for l in lines if re.search(r'@Disabled|@EnabledOnOs|@DisabledOnOs|@EnabledIf|assume(True|False|That)', l)]
+                      reason = '; '.join(hits) if hits else 'no reason in source'
+                  print(f'SKIPPED TEST {cls}.{name} - reason: {reason}')
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.5.7.jar
+          if-no-files-found: error

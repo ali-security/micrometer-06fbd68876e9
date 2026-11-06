@@ -3,7 +3,7 @@ buildscript {
         jcenter()
         gradlePluginPortal()
         maven {
-            url 'https://repo.spring.io/plugins-release'
+            url 'https://maven.aliyun.com/repository/jcenter'
         }
         mavenLocal()
     }
